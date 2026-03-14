@@ -67,10 +67,10 @@ try:
     MAX_PAIRS           = getattr(_cfg, "MAX_PAIRS",           20)
     TRADE_VALUE_USDC    = getattr(_cfg, "TRADE_VALUE_USDC",    100.0)
     BALANCE_BUFFER      = getattr(_cfg, "BALANCE_BUFFER",      1.5)
-    MIN_VOLUME_USDC     = getattr(_cfg, "MIN_VOLUME_USDC",     5_000_000)
-    MIN_TRADES_24H      = getattr(_cfg, "MIN_TRADES_24H",      1000)
-    MIN_VOLATILITY      = getattr(_cfg, "MIN_VOLATILITY",      1.5)
-    MAX_VOLATILITY      = getattr(_cfg, "MAX_VOLATILITY",      8.0)
+    MIN_VOLUME_USDC     = getattr(_cfg, "MIN_VOLUME_USDC",     1_000_000)
+    MIN_TRADES_24H      = getattr(_cfg, "MIN_TRADES_24H",      500)
+    MIN_VOLATILITY      = getattr(_cfg, "MIN_VOLATILITY",      0.5)
+    MAX_VOLATILITY      = getattr(_cfg, "MAX_VOLATILITY",      12.0)
     OPT_LOOKBACK        = getattr(_cfg, "OPT_LOOKBACK",        "90 days ago UTC")
     OPT_MIN_TRADES      = getattr(_cfg, "OPT_MIN_TRADES",      10)
     CHECK_INTERVAL_SEC  = getattr(_cfg, "CHECK_INTERVAL_SEC",  30)
@@ -111,7 +111,7 @@ except ImportError:
 
 # Fixed constants (not user-configurable)
 BLACKLIST    = ["USDTUSDC","BUSDUSDC","TUSDUSDC","BETHUSDC","WBETHUSDC","EURUSDC"]
-OPT_INTERVAL = Client.KLINE_INTERVAL_1HOUR
+OPT_INTERVAL = Client.KLINE_INTERVAL_30MINUTE
 OPT_SL_RANGE = [round(x,1) for x in np.arange(0.5, 5.5, 0.5)]
 OPT_TP_RANGE = [round(x,1) for x in np.arange(1.0, 15.0, 0.5)]
 MAKER_FEE    = 0.001
@@ -352,7 +352,7 @@ def cleanup_portfolio(trade_client: Client, market_client: Client) -> None:
 
     # Get all current prices in one call from live Binance
     try:
-        tickers = {t["symbol"]: float(t["price"]) for t in market_client.get_ticker()}
+        tickers = {t["symbol"]: float(t["lastPrice"]) for t in market_client.get_ticker()}
     except Exception as e:
         cleanup_log.warning(f"Could not fetch prices: {e} -- skipping cleanup")
         return
@@ -433,7 +433,7 @@ def cleanup_portfolio(trade_client: Client, market_client: Client) -> None:
 def _fetch_rsi(client, symbol, periods=14) -> float:
     try:
         klines = client.get_klines(
-            symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=periods+1)
+            symbol=symbol, interval=Client.KLINE_INTERVAL_30MINUTE, limit=periods+1)
         closes = np.array([float(k[4]) for k in klines])
         d      = np.diff(closes)
         gains  = np.where(d > 0, d, 0)
@@ -447,7 +447,7 @@ def _fetch_rsi(client, symbol, periods=14) -> float:
 def _fetch_sma_distance(client, symbol, period=20) -> float:
     try:
         klines = client.get_klines(
-            symbol=symbol, interval=Client.KLINE_INTERVAL_1HOUR, limit=period)
+            symbol=symbol, interval=Client.KLINE_INTERVAL_30MINUTE, limit=period)
         closes = [float(k[4]) for k in klines]
         sma    = np.mean(closes[:-1])
         return round((closes[-1] - sma) / sma * 100, 3)
@@ -455,7 +455,91 @@ def _fetch_sma_distance(client, symbol, period=20) -> float:
         return 0.0
 
 
-def _score(row, rsi, sma_dist) -> dict:
+def _fetch_momentum(client, symbol, period=10) -> float:
+    """
+    Rate of Change (ROC): % price change over last N candles.
+    Positive = upward momentum, negative = downward.
+    """
+    try:
+        klines = client.get_klines(
+            symbol=symbol, interval=Client.KLINE_INTERVAL_30MINUTE, limit=period+1)
+        closes = [float(k[4]) for k in klines]
+        if closes[0] == 0:
+            return 0.0
+        return round((closes[-1] - closes[0]) / closes[0] * 100, 3)
+    except Exception:
+        return 0.0
+
+
+def _fetch_volume_surge(client, symbol, period=20) -> float:
+    """
+    Volume surge ratio: current candle volume vs average of last N candles.
+    >1.5 = volume surge (increased interest), <0.5 = drying up.
+    """
+    try:
+        klines = client.get_klines(
+            symbol=symbol, interval=Client.KLINE_INTERVAL_30MINUTE, limit=period+1)
+        volumes = [float(k[5]) for k in klines]
+        avg_vol  = np.mean(volumes[:-1])
+        if avg_vol == 0:
+            return 1.0
+        return round(volumes[-1] / avg_vol, 3)
+    except Exception:
+        return 1.0
+
+
+def _fetch_macd(client, symbol) -> float:
+    """
+    MACD histogram value (12/26/9 standard settings on 30m candles).
+    Positive = bullish crossover, negative = bearish.
+    Returns histogram value normalised as % of price.
+    """
+    try:
+        klines = client.get_klines(
+            symbol=symbol, interval=Client.KLINE_INTERVAL_30MINUTE, limit=60)
+        closes = np.array([float(k[4]) for k in klines])
+        # EMA helper
+        def ema(data, span):
+            k = 2 / (span + 1)
+            e = data[0]
+            result = [e]
+            for v in data[1:]:
+                e = v * k + e * (1 - k)
+                result.append(e)
+            return np.array(result)
+        ema12    = ema(closes, 12)
+        ema26    = ema(closes, 26)
+        macd     = ema12 - ema26
+        signal   = ema(macd, 9)
+        hist     = macd[-1] - signal[-1]
+        # Normalise as % of price so it's comparable across coins
+        price    = closes[-1]
+        return round(hist / price * 100, 4) if price > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def _fetch_bollinger_squeeze(client, symbol, period=20) -> float:
+    """
+    Bollinger Band width as % of price.
+    Narrow bands (squeeze) = volatility compression before a breakout.
+    Returns band width %. Lower = tighter squeeze.
+    """
+    try:
+        klines = client.get_klines(
+            symbol=symbol, interval=Client.KLINE_INTERVAL_30MINUTE, limit=period)
+        closes  = np.array([float(k[4]) for k in klines])
+        sma     = np.mean(closes)
+        std     = np.std(closes)
+        upper   = sma + 2 * std
+        lower   = sma - 2 * std
+        width   = (upper - lower) / sma * 100 if sma > 0 else 0
+        return round(width, 3)
+    except Exception:
+        return 10.0
+
+
+def _score(row, rsi, sma_dist, momentum=0.0, vol_surge=1.0, macd=0.0, bb_width=10.0) -> dict:
     price  = row["lastPrice"]
     volume = row["quoteVolume"]
     change = row["priceChangePercent"]
@@ -467,14 +551,63 @@ def _score(row, rsi, sma_dist) -> dict:
     vol_s = 0.0
     if volume > 0 and MIN_VOLUME_USDC > 0:
         try:
-            vol_s = min(20, max(0, (np.log10(volume) - np.log10(MIN_VOLUME_USDC)) * 6))
+            vol_s = min(14, max(0, (np.log10(volume) - np.log10(MIN_VOLUME_USDC)) * 5))
         except Exception:
             vol_s = 0.0
 
-    rng_s = max(0, min(20, 20 - abs(rng - 3.5) * 4)) if MIN_VOLATILITY <= rng <= MAX_VOLATILITY else 0
-    rsi_s = 20 if 45 <= rsi <= 65 else (12 if 35 <= rsi <= 75 else 4)
-    mom_s = 20 if 0.5 <= change <= 5 else (10 if -1 <= change < 0.5 or 5 < change <= 10 else 2)
-    sma_s = 20 if 0.5 <= sma_dist <= 3 else (14 if 0 <= sma_dist < 0.5 else (8 if -1 <= sma_dist < 0 else 4))
+    rng_s  = max(0, min(10, 10 - abs(rng - 3.5) * 2)) if MIN_VOLATILITY <= rng <= MAX_VOLATILITY else 0
+    rsi_s  = 10 if 45 <= rsi <= 65 else (6 if 35 <= rsi <= 75 else 2)
+    sma_s  = 10 if 0.5 <= sma_dist <= 3 else (7 if 0 <= sma_dist < 0.5 else (4 if -1 <= sma_dist < 0 else 2))
+
+    # -- New dynamic indicators (total 56 points) ----------------------
+
+    # Price momentum / Rate of Change (0-16)
+    # Strong positive momentum = coin is accelerating upward on 30m
+    if momentum >= 2.0:
+        mom_s = 16    # Strong upward momentum
+    elif momentum >= 0.5:
+        mom_s = 12    # Moderate upward momentum
+    elif momentum >= 0.0:
+        mom_s = 6     # Flat
+    elif momentum >= -1.0:
+        mom_s = 3     # Slight pullback
+    else:
+        mom_s = 0     # Downward momentum -- avoid
+
+    # Volume surge (0-16)
+    # Volume spike vs average = smart money moving in
+    if vol_surge >= 2.5:
+        vsurge_s = 16   # Major volume spike -- strong signal
+    elif vol_surge >= 1.5:
+        vsurge_s = 12   # Above average volume
+    elif vol_surge >= 0.8:
+        vsurge_s = 6    # Normal volume
+    else:
+        vsurge_s = 2    # Volume drying up -- avoid
+
+    # MACD histogram (0-14)
+    # Positive histogram = bullish momentum building
+    if macd > 0.05:
+        macd_s = 14     # Strong bullish MACD
+    elif macd > 0.01:
+        macd_s = 10     # Mild bullish
+    elif macd > -0.01:
+        macd_s = 5      # Neutral
+    else:
+        macd_s = 1      # Bearish MACD -- avoid
+
+    # Bollinger Band squeeze (0-10)
+    # Tight bands = compression before breakout
+    if bb_width < 2.0:
+        bb_s = 10       # Very tight squeeze -- breakout imminent
+    elif bb_width < 4.0:
+        bb_s = 7        # Moderate squeeze
+    elif bb_width < 7.0:
+        bb_s = 4        # Normal width
+    else:
+        bb_s = 1        # Wide bands -- already expanded
+
+    total = vol_s + rng_s + rsi_s + sma_s + mom_s + vsurge_s + macd_s + bb_s
 
     return {
         "symbol":          row["symbol"],
@@ -484,7 +617,11 @@ def _score(row, rsi, sma_dist) -> dict:
         "daily_range_pct": round(rng, 2),
         "rsi_14":          rsi,
         "sma_dist":        sma_dist,
-        "total_score":     round(vol_s + rng_s + rsi_s + mom_s + sma_s, 1),
+        "momentum":        momentum,
+        "vol_surge":       vol_surge,
+        "macd":            macd,
+        "bb_width":        bb_width,
+        "total_score":     round(total, 1),
     }
 
 
@@ -554,20 +691,57 @@ def run_pair_selection(market_client: Client, trade_client: Client) -> list:
     else:
         log.warning("Trade count data unavailable -- skipping trade count filter")
 
-    if len(df) == 0:
-        log.error("No pairs passed filters! Try lowering MIN_VOLUME_USDC, MIN_TRADES_24H or MIN_VOLATILITY.")
-        raise SystemExit(1)
+    # Dynamic fallback -- if too few pairs found, progressively relax filters
+    # This ensures the bot always has enough pairs to trade
+    fallback_steps = [
+        {"vol": 500_000,  "trades": 200,  "min_v": 0.3, "max_v": 15.0},
+        {"vol": 100_000,  "trades": 50,   "min_v": 0.1, "max_v": 20.0},
+    ]
+    MIN_PAIRS_NEEDED = max(4, (getattr(__import__('builtins'), '_AUTO_TOP_N', TOP_N) or TOP_N or 4))
+
+    if len(df) < MIN_PAIRS_NEEDED:
+        log.warning(f"Only {len(df)} pairs found -- need at least {MIN_PAIRS_NEEDED}. Relaxing filters ...")
+        for step in fallback_steps:
+            # Re-apply from scratch with relaxed filters
+            df2 = tickers[tickers["symbol"].str.endswith("USDC")].copy()
+            df2 = df2[~df2["symbol"].isin(BLACKLIST)]
+            for col in ["lastPrice","quoteVolume","priceChangePercent","highPrice","lowPrice","count"]:
+                df2[col] = pd.to_numeric(df2[col], errors="coerce")
+            df2 = df2.dropna(subset=["lastPrice","quoteVolume","priceChangePercent","highPrice","lowPrice"])
+            df2 = df2[df2["quoteVolume"] >= step["vol"]]
+            df2["_rng"] = (df2["highPrice"] - df2["lowPrice"]) / df2["lowPrice"] * 100
+            df2 = df2[(df2["_rng"] >= step["min_v"]) & (df2["_rng"] <= step["max_v"])]
+            if "count" in df2.columns:
+                df2 = df2[df2["count"] >= step["trades"]]
+            df2 = df2.reset_index(drop=True)
+            log.info(
+                f"  Fallback (vol>={step['vol']/1e3:.0f}k, trades>={step['trades']}, "
+                f"vol {step['min_v']}-{step['max_v']}%): {len(df2)} pairs"
+            )
+            if len(df2) >= MIN_PAIRS_NEEDED:
+                df = df2
+                break
+        if len(df) < 1:
+            log.error("No pairs found even with relaxed filters! Check your Binance account settings.")
+            raise SystemExit(1)
+
+    log.info(f"Final candidate pool: {len(df)} pairs")
 
     log.info(f"Analysing {len(df)} pairs (RSI + SMA) -- ~1-2 min ...")
 
     scores = []
     for i, (_, row) in enumerate(df.iterrows()):
-        rsi = _fetch_rsi(market_client, row["symbol"])
-        sma = _fetch_sma_distance(market_client, row["symbol"])
-        scores.append(_score(row, rsi, sma))
-        if (i + 1) % 15 == 0:
+        sym = row["symbol"]
+        rsi      = _fetch_rsi(market_client, sym)
+        sma      = _fetch_sma_distance(market_client, sym)
+        momentum = _fetch_momentum(market_client, sym)
+        vol_surge= _fetch_volume_surge(market_client, sym)
+        macd     = _fetch_macd(market_client, sym)
+        bb_width = _fetch_bollinger_squeeze(market_client, sym)
+        scores.append(_score(row, rsi, sma, momentum, vol_surge, macd, bb_width))
+        if (i + 1) % 10 == 0:
             log.info(f"  Scored {i+1}/{len(df)} pairs ...")
-        time.sleep(0.1)
+        time.sleep(0.15)  # Slightly longer delay -- 6 API calls per pair
 
     if not scores:
         log.error("Scoring produced no results. Check your filters.")
@@ -1206,7 +1380,7 @@ body{background:var(--bg);color:var(--text);font-family:'DM Sans',sans-serif;min
       <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Time</th><th>Pair</th><th>Action</th><th>Qty</th><th>Price</th><th>PnL%</th><th>Note</th></tr></thead><tbody id="trades-table"></tbody></table></div>
     </div>
     <div class="page" id="page-scores">
-      <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Pair</th><th>Score</th><th>Volume</th><th>24h%</th><th>Range%</th><th>RSI</th><th>SMA</th></tr></thead><tbody id="scores-table"></tbody></table></div>
+      <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Pair</th><th>Score</th><th>RSI</th><th>Momentum</th><th>Vol Surge</th><th>MACD</th><th>BB Width</th></tr></thead><tbody id="scores-table"></tbody></table></div>
     </div>
   </div>
 </div>
@@ -1245,19 +1419,38 @@ function render(d){
   document.getElementById('trades-table').innerHTML=trH;lastTradeCount=nc;
   let scH='';
   if(!d.scores||!d.scores.length)scH='<tr><td colspan="7" class="empty">Waiting for Stage 1...</td></tr>';
-  else d.scores.forEach((s,i)=>{const sc=parseFloat(s.total_score||0),pct=Math.round(sc/100*100),chg=parseFloat(s.change_24h_pct||0);scH+='<tr><td class="mono">'+(i<4?'<span class="pill pill-gold" style="margin-right:6px">#'+(i+1)+'</span>':'')+s.symbol+'</td><td><div style="display:flex;align-items:center;gap:8px"><div class="score-bar-bg" style="width:80px"><div class="score-bar-fill" style="width:'+pct+'%"></div></div><span class="mono" style="font-size:11px">'+sc.toFixed(1)+'</span></div></td><td class="mono">$'+parseFloat(s.volume_24h_M||0).toFixed(0)+'M</td><td class="mono" style="color:'+(chg>=0?'var(--green)':'var(--red))+'">'+(chg>=0?'+':'')+chg.toFixed(2)+'%</td><td class="mono">'+parseFloat(s.daily_range_pct||0).toFixed(2)+'%</td><td class="mono">'+parseFloat(s.rsi_14||0).toFixed(1)+'</td><td class="mono">'+parseFloat(s.sma_dist||0).toFixed(2)+'%</td></tr>'});
+  else d.scores.forEach((s,i)=>{const sc=parseFloat(s.total_score||0),pct=Math.round(sc/100*100),chg=parseFloat(s.change_24h_pct||0);const mom=parseFloat(s.momentum||0),vs=parseFloat(s.vol_surge||1),mc=parseFloat(s.macd||0),bb=parseFloat(s.bb_width||10);
+    scH+='<tr><td class="mono">'+(i<4?'<span class="pill pill-gold" style="margin-right:6px">#'+(i+1)+'</span>':'')+s.symbol+'</td><td><div style="display:flex;align-items:center;gap:8px"><div class="score-bar-bg" style="width:80px"><div class="score-bar-fill" style="width:'+pct+'%"></div></div><span class="mono" style="font-size:11px">'+sc.toFixed(1)+'</span></div></td><td class="mono">'+parseFloat(s.rsi_14||0).toFixed(1)+'</td><td class="mono" style="color:'+(mom>=0?'var(--green)':'var(--red)')+'">'+( mom>=0?'+':'')+mom.toFixed(2)+'%</td><td class="mono" style="color:'+(vs>=1.5?'var(--green)':vs<0.8?'var(--red)':'var(--text)')+'">'+vs.toFixed(2)+'x</td><td class="mono" style="color:'+(mc>0?'var(--green)':mc<0?'var(--red)':'var(--text)')+'">'+mc.toFixed(3)+'</td><td class="mono" style="color:'+(bb<2?'var(--gold)':bb<4?'var(--green)':'var(--text)')+'">'+bb.toFixed(1)+'%</td></tr>';
   document.getElementById('scores-table').innerHTML=scH;
   const labels=d.pnl_chart.map(p=>p.time),vals=d.pnl_chart.map(p=>p.pnl);
   const lc=vals.length&&vals[vals.length-1]>=0?'#22c55e':'#ef4444';
   if(!pnlChart){const ctx=document.getElementById('pnl-chart').getContext('2d');pnlChart=new Chart(ctx,{type:'line',data:{labels,datasets:[{label:'PnL (USDC)',data:vals,borderColor:lc,backgroundColor:lc==='#22c55e'?'rgba(34,197,94,0.08)':'rgba(239,68,68,0.08)',borderWidth:2,pointRadius:0,fill:true,tension:0.3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{display:false},y:{grid:{color:'rgba(255,255,255,0.05)'},ticks:{color:'#64748b',font:{family:'Space Mono',size:10},callback:v=>(v>=0?'+':'')+v.toFixed(2)+' USDC'}}}}})}
   else{pnlChart.data.labels=labels;pnlChart.data.datasets[0].data=vals;pnlChart.data.datasets[0].borderColor=lc;pnlChart.update('none')}
 }
-function connectSSE(){
-  const es=new EventSource('/stream');
-  es.onopen=()=>setConnected(true);
-  es.onmessage=e=>{try{render(JSON.parse(e.data))}catch(err){}};
-  es.onerror=()=>{setConnected(false);es.close();setTimeout(connectSSE,3000)};
+// Primary: reliable polling every 3 seconds (works on all platforms)
+async function poll(){
+  try{
+    const r=await fetch('/api/data');
+    if(r.ok){const d=await r.json();render(d);setConnected(true);}
+    else{setConnected(false);}
+  }catch(e){setConnected(false);}
 }
+
+// Secondary: SSE for instant push updates (bonus, not required)
+function connectSSE(){
+  try{
+    const es=new EventSource('/stream');
+    es.onopen=()=>setConnected(true);
+    es.onmessage=e=>{try{render(JSON.parse(e.data))}catch(err){}};
+    es.onerror=()=>{es.close();setTimeout(connectSSE,10000)};
+  } catch(e){}
+}
+
+// Start polling immediately and every 3 seconds
+poll();
+setInterval(poll, 3000);
+
+// Also try SSE for instant updates
 connectSSE();
 </script>
 </body>
