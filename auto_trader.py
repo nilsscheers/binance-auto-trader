@@ -112,8 +112,13 @@ except ImportError:
 # Fixed constants (not user-configurable)
 BLACKLIST    = ["USDTUSDC","BUSDUSDC","TUSDUSDC","BETHUSDC","WBETHUSDC","EURUSDC"]
 OPT_INTERVAL = Client.KLINE_INTERVAL_30MINUTE
-OPT_SL_RANGE = [round(x,1) for x in np.arange(0.5, 5.5, 0.5)]
-OPT_TP_RANGE = [round(x,1) for x in np.arange(1.0, 15.0, 0.5)]
+# SL starts at 1.5% minimum -- 0.5% is too tight and causes constant stop-outs from noise
+_sl_min = getattr(_cfg, "OPT_SL_MIN", 1.5) if "_cfg" in dir() else 1.5
+_sl_max = getattr(_cfg, "OPT_SL_MAX", 5.5) if "_cfg" in dir() else 5.5
+_tp_min = getattr(_cfg, "OPT_TP_MIN", 2.0) if "_cfg" in dir() else 2.0
+_tp_max = getattr(_cfg, "OPT_TP_MAX", 15.0) if "_cfg" in dir() else 15.0
+OPT_SL_RANGE = [round(x,1) for x in np.arange(_sl_min, _sl_max, 0.5)]
+OPT_TP_RANGE = [round(x,1) for x in np.arange(_tp_min, _tp_max, 0.5)]
 MAKER_FEE    = 0.001
 LOG_FILE     = "auto_trader.log"
 TRADE_FILE   = "trade_history.csv"
@@ -1419,8 +1424,28 @@ function render(d){
   document.getElementById('trades-table').innerHTML=trH;lastTradeCount=nc;
   let scH='';
   if(!d.scores||!d.scores.length)scH='<tr><td colspan="7" class="empty">Waiting for Stage 1...</td></tr>';
-  else d.scores.forEach((s,i)=>{const sc=parseFloat(s.total_score||0),pct=Math.round(sc/100*100),chg=parseFloat(s.change_24h_pct||0);const mom=parseFloat(s.momentum||0),vs=parseFloat(s.vol_surge||1),mc=parseFloat(s.macd||0),bb=parseFloat(s.bb_width||10);
-    scH+='<tr><td class="mono">'+(i<4?'<span class="pill pill-gold" style="margin-right:6px">#'+(i+1)+'</span>':'')+s.symbol+'</td><td><div style="display:flex;align-items:center;gap:8px"><div class="score-bar-bg" style="width:80px"><div class="score-bar-fill" style="width:'+pct+'%"></div></div><span class="mono" style="font-size:11px">'+sc.toFixed(1)+'</span></div></td><td class="mono">'+parseFloat(s.rsi_14||0).toFixed(1)+'</td><td class="mono" style="color:'+(mom>=0?'var(--green)':'var(--red)')+'">'+( mom>=0?'+':'')+mom.toFixed(2)+'%</td><td class="mono" style="color:'+(vs>=1.5?'var(--green)':vs<0.8?'var(--red)':'var(--text)')+'">'+vs.toFixed(2)+'x</td><td class="mono" style="color:'+(mc>0?'var(--green)':mc<0?'var(--red)':'var(--text)')+'">'+mc.toFixed(3)+'</td><td class="mono" style="color:'+(bb<2?'var(--gold)':bb<4?'var(--green)':'var(--text)')+'">'+bb.toFixed(1)+'%</td></tr>';
+  else d.scores.forEach((s,i)=>{
+    const sc=parseFloat(s.total_score||0),pct=Math.round(sc/100*100);
+    const chg=parseFloat(s.change_24h_pct||0);
+    const mom=parseFloat(s.momentum||0);
+    const vs=parseFloat(s.vol_surge||1);
+    const mc=parseFloat(s.macd||0);
+    const bb=parseFloat(s.bb_width||10);
+    const momColor=mom>=0?'var(--green)':'var(--red)';
+    const vsColor=vs>=1.5?'var(--green)':(vs<0.8?'var(--red)':'var(--text)');
+    const mcColor=mc>0?'var(--green)':(mc<0?'var(--red)':'var(--text)');
+    const bbColor=bb<2?'var(--gold)':(bb<4?'var(--green)':'var(--text)');
+    const rank=i<4?'<span class="pill pill-gold" style="margin-right:6px">#'+(i+1)+'</span>':'';
+    const bar='<div style="display:flex;align-items:center;gap:8px"><div class="score-bar-bg" style="width:80px"><div class="score-bar-fill" style="width:'+pct+'%"></div></div><span class="mono" style="font-size:11px">'+sc.toFixed(1)+'</span></div>';
+    scH+='<tr>';
+    scH+='<td class="mono">'+rank+s.symbol+'</td>';
+    scH+='<td>'+bar+'</td>';
+    scH+='<td class="mono">'+parseFloat(s.rsi_14||0).toFixed(1)+'</td>';
+    scH+='<td class="mono" style="color:'+momColor+'">'+(mom>=0?'+':'')+mom.toFixed(2)+'%</td>';
+    scH+='<td class="mono" style="color:'+vsColor+'">'+vs.toFixed(2)+'x</td>';
+    scH+='<td class="mono" style="color:'+mcColor+'">'+mc.toFixed(3)+'</td>';
+    scH+='<td class="mono" style="color:'+bbColor+'">'+bb.toFixed(1)+'%</td>';
+    scH+='</tr>';
   document.getElementById('scores-table').innerHTML=scH;
   const labels=d.pnl_chart.map(p=>p.time),vals=d.pnl_chart.map(p=>p.pnl);
   const lc=vals.length&&vals[vals.length-1]>=0?'#22c55e':'#ef4444';
