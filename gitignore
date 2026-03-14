@@ -1,0 +1,35 @@
+# =====================================================================
+# .gitignore  --  Files that should NEVER be uploaded to GitHub
+# =====================================================================
+
+# Your personal settings (contains API keys -- keep this private!)
+config.py
+
+# Push update script (contains GitHub token -- keep this private!)
+push_update.py
+
+# Log and data files (personal trading history)
+*.log
+trade_history.csv
+pair_scores.csv
+suggested_pairs.py
+best_params.txt
+optimizer_results.csv
+state.json
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environment files (alternative way to store keys)
+.env
+*.env
+
+# Windows system files
+Thumbs.db
+desktop.ini
+
+# Mac system files
+.DS_Store
